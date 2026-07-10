@@ -1,0 +1,20 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: agz
+      MYSQL_USER: agz
+      MYSQL_PASSWORD: agz
+      MYSQL_ROOT_PASSWORD: root
+    ports: ['3306:3306']
+    volumes: ['mysql_data:/var/lib/mysql']
+    healthcheck:
+      test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost', '-proot']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  mailpit:
+    image: axllent/mailpit:v1.25
+    ports: ['1025:1025', '8025:8025']
+volumes:
+  mysql_data:
