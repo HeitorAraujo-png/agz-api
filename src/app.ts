@@ -3,7 +3,7 @@ import cors from '@fastify/cors'
 import jwt from '@fastify/jwt'
 import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
-import { Prisma, PrismaClient } from '@prisma/client'
+import { MemberLevel, Prisma, PrismaClient } from '@prisma/client'
 import argon2 from 'argon2'
 import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify'
 import nodemailer from 'nodemailer'
@@ -25,7 +25,14 @@ const profile = (member: {
   id: member.memberId,
   name: member.username,
   email: member.email,
-  level: member.level === 'USER' ? 'Usuário' : 'Organizador',
+  level:
+    {
+      USER: 'Usuário',
+      ORGANIZER: 'Organizador',
+      ADMIN: 'Administrador',
+      PRESIDENT: 'Presidente',
+      SUPER_ADMIN: 'Super Administrador',
+    }[member.level] ?? 'Usuário',
   mustChangePassword: member.mustChangePassword,
 })
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -136,6 +143,12 @@ export function buildApp(options: { prisma?: PrismaClient; settings?: Config } =
     const member = await memberFromRequest(request)
     if (member.level === 'USER')
       throw new ApiError(403, 'Somente organizadores podem acessar este recurso.')
+    return member
+  }
+  const administratorFromRequest = async (request: FastifyRequest) => {
+    const member = await memberFromRequest(request)
+    if (!['ADMIN', 'PRESIDENT', 'SUPER_ADMIN'].includes(member.level))
+      throw new ApiError(403, 'Somente administradores podem acessar este recurso.')
     return member
   }
   const blocked = async (date: Date) => {
@@ -274,6 +287,44 @@ export function buildApp(options: { prisma?: PrismaClient; settings?: Config } =
     return { message: 'Senha redefinida.' }
   })
 
+  app.post('/v1/members', async (request, reply) => {
+    await administratorFromRequest(request)
+    const body = z
+      .object({
+        username: z.string().trim().min(3).max(80),
+        memberId: z.string().trim().min(1).max(10),
+        email: z.string().trim().email().max(255),
+        password: z.string(),
+        level: z.enum(['USER', 'ORGANIZER']),
+        phone: z.string().trim().max(15).optional(),
+      })
+      .parse(request.body)
+    try {
+      validatePassword(body.password)
+    } catch (error) {
+      throw new ApiError(400, error instanceof Error ? error.message : 'Senha inválida.')
+    }
+    const existing = await prisma.member.findFirst({
+      where: {
+        OR: [{ username: body.username }, { memberId: body.memberId }, { email: body.email }],
+      },
+      select: { id: true },
+    })
+    if (existing) throw new ApiError(409, 'Usuário, matrícula ou e-mail já cadastrado.')
+    const member = await prisma.member.create({
+      data: {
+        username: body.username,
+        memberId: body.memberId,
+        email: body.email,
+        phone: body.phone || null,
+        passwordHash: await argon2.hash(body.password),
+        level: body.level === 'USER' ? MemberLevel.USER : MemberLevel.ORGANIZER,
+        mustChangePassword: true,
+      },
+    })
+    return reply.status(201).send({ member: profile(member) })
+  })
+
   app.get('/v1/calendar', async (request) => {
     await memberFromRequest(request)
     const query = z
@@ -391,6 +442,57 @@ export function buildApp(options: { prisma?: PrismaClient; settings?: Config } =
         orderBy: { date: 'asc' },
       })
       .then((items) => items.map((item) => ({ ...item, date: dateKey(item.date) })))
+  })
+  app.get('/v1/dashboard', async (request) => {
+    await organizerFromRequest(request)
+    const query = z
+      .object({
+        year: z.coerce.number().int().min(2020).max(2100),
+        month: z.coerce.number().int().min(1).max(12),
+      })
+      .parse(request.query)
+    const { start, end } = monthBounds(query.year, query.month)
+    const [reservations, events, rentals, activeMembers] = await Promise.all([
+      prisma.reservation.findMany({
+        where: { date: { gte: start, lte: end } },
+        select: { date: true },
+      }),
+      prisma.event.findMany({
+        where: { date: { gte: start, lte: end } },
+        select: { date: true, active: true },
+      }),
+      prisma.rental.findMany({
+        where: {
+          active: true,
+          OR: [
+            { startDate: { gte: start, lte: end } },
+            { eventDate: { gte: start, lte: end } },
+            { endDate: { gte: start, lte: end } },
+          ],
+        },
+        select: { startDate: true, eventDate: true, endDate: true, active: true },
+      }),
+      prisma.member.count({ where: { active: true } }),
+    ])
+    const monthStart = new Date(Date.UTC(query.year, query.month - 1, 1))
+    const cells = buildCalendar(
+      query.year,
+      query.month,
+      settings.unavailableWeekdays,
+      { reservations, events, rentals },
+      monthStart,
+    ).filter((cell) => cell.inCurrentMonth)
+    const availableSlots = cells
+      .filter((cell) => ['available', 'partial', 'full'].includes(cell.status))
+      .reduce((total, cell) => total + 5 - cell.reservations, 0)
+    const capacity = availableSlots + reservations.length
+    return {
+      reservations: reservations.length,
+      availableSlots,
+      occupancyRate: capacity ? Math.round((reservations.length / capacity) * 100) : 0,
+      events: events.filter((event) => event.active).length,
+      activeMembers,
+    }
   })
   app.post('/v1/events', async (request, reply) => {
     await organizerFromRequest(request)
